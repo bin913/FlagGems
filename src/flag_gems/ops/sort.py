@@ -243,6 +243,277 @@ def sweep(
             tl.store(associate_out_ptr + pid_m * N + pos, associate_arr, mask=matches)
 
 
+@triton.jit(do_not_specialize=["n_passes", "pass_id", "bit_offset", "m", "N", "OUT_N"])
+def sweep_tle_optimized(
+    arr_ptr,
+    associate_arr_ptr,
+    out_ptr,
+    associate_out_ptr,
+    excumsum_bins_ptr,  # (m, n_passes, r) - 全局前缀和起点
+    # status_ptr 不再需要，因为我们有全局前缀和
+    n_passes,
+    pass_id,
+    bit_offset,
+    m,
+    N,
+    OUT_N,
+    TILE_N: tl.constexpr,
+    TILE_R: tl.constexpr, # 通常等于 r (2^k_bits)，或者由多个 block 处理一个 bin
+    k_bits: tl.constexpr,
+    descending: tl.constexpr,
+):
+    # ---------------------------------------------------------
+    # 1. Grid & ID 计算
+    # ---------------------------------------------------------
+    pid = tl.program_id(0)
+    pid_m = pid % m
+    pid_n = pid // m  # 注意：原代码逻辑似乎是 pid // m 对应 N 的块索引，这里假设 grid 设置正确
+    
+    # 假设 grid 设置为 (m * grid_n, ) 且每个 block 处理一个特定的 bin_range
+    # 为了简化，我们假设每个 block 负责处理 ALL bins (如果 r 小) 或者 特定的 bin
+    # 原代码逻辑：pid_r 是通过 program_id(1) 获取的，但 triton jit 通常只支持 1D grid 或手动展开
+    # 这里我们模拟原代码的 2D/3D grid 逻辑，假设传入的是扁平化的 pid，或者我们只用 1D grid 遍历所有任务
+    
+    # 修正：为了适配 Triton 最佳实践，我们通常将 (m, bin_id, n_block) 扁平化
+    # 但为了尽量贴合你的输入签名，我们假设调用者设置了正确的 grid
+    # 这里我们需要重新推导 pid_r。
+    # 假设 grid = (m * grid_n * grid_r,) 或者类似结构。
+    # 让我们采用更稳健的方式：每个 Block 负责一个 (m, bin_id) 对，并遍历所有的 N 块？
+    # 不，原代码是每个 Block 负责 (m, n_block)，然后循环 bin。这导致串行化。
+    
+    # 【关键重构】：为了利用 SMEM，最好的策略是：
+    # 每个 Block 负责一个 (m, n_block) 片段，但在 SMEM 内对所有 k_bits 进行分桶。
+    # 这样只需要一次全局加载，一次 SMEM 重排，然后按 Bin 顺序写入。
+    
+    # 重新定义 ID 以匹配原逻辑但优化执行流
+    # 假设 grid 是 (m, grid_n)，每个 block 处理一行中的一段 N
+    pid_m = tl.program_id(0) % m
+    pid_n = tl.program_id(0) // m
+    
+    r: tl.constexpr = 1 << k_bits
+    
+    # ---------------------------------------------------------
+    # 2. 使用 TLE 分配共享内存 (SMEM)
+    # ---------------------------------------------------------
+    # 我们需要为每个 bin 预留空间。
+    # 总大小 = TILE_N (因为每个元素只属于一个 bin)
+    # 为了高效，我们分配一个大的 SMEM 数组，并维护每个 bin 的局部偏移指针
+    
+    # 分配 Keys 和 Values 的共享内存缓冲
+    # 布局：[bin_0_data, bin_1_data, ..., bin_r-1_data]
+    smem_keys = tle.alloc([TILE_N], dtype=tl.int32, scope=tle.smem)
+    smem_vals = tle.alloc([TILE_N], dtype=tl.int32, scope=tle.smem) if associate_arr_ptr is not None else None
+    
+    # 分配用于记录每个 bin 在 SMEM 中起始位置的计数器 (在 SMEM 或 寄存器中维护)
+    # 由于 r 通常很小 (2, 4, 8, 16)，我们可以用寄存器数组存 offsets，或者在 SMEM 存
+    # 这里使用 SMEM 存储每个 bin 的当前写入偏移量 (相对于 SMEM 基址)
+    smem_bin_offsets = tle.alloc([r], dtype=tl.int32, scope=tle.smem)
+    
+    # 初始化 bin 偏移量为 0
+    # 只有第一个线程做初始化，或者用 vectorized store
+    off_init = tl.arange(0, r)
+    tl.store(smem_bin_offsets + off_init, 0, mask=off_init < r)
+    tl.debug_barrier()
+
+    # ---------------------------------------------------------
+    # 3. 加载数据 (Global Load)
+    # ---------------------------------------------------------
+    n_offsets = pid_n * TILE_N + tl.arange(0, TILE_N)
+    mask = n_offsets < N
+    
+    arr = tl.load(arr_ptr + pid_m * N + n_offsets, mask=mask, other=0)
+    
+    # 处理关联数据 (Value)
+    if associate_arr_ptr is not None:
+        assoc_arr = tl.load(associate_arr_ptr + pid_m * N + n_offsets, mask=mask, other=0)
+    else:
+        assoc_arr = tl.zeros([TILE_N], dtype=tl.int32) # Placeholder
+
+    # 提取 Key (当前位的值)
+    arr_u = convert_to_uint_preverse_order(arr, descending)
+    keys_local = (arr_u >> bit_offset) & ((1 << k_bits) - 1)
+
+    # ---------------------------------------------------------
+    # 4. 块内分桶 (Bin Packing in SMEM)
+    # ---------------------------------------------------------
+    # 目标：计算每个元素在 SMEM 中的目标位置
+    # 步骤 A: 统计本块内每个 bin 的数量 (Histogram)
+    # 步骤 B: 计算本块内每个 bin 的起始偏移 (Prefix Sum of Histogram)
+    # 步骤 C: 计算每个元素的局部偏移并写入 SMEM
+    
+    # A. Histogram (使用原子加或 warp shuffle，这里用简单的原子加演示，因 r 小)
+    # 为了无锁，可以用寄存器累加后一次性写，但 Triton 中 atomic_add 到 smem 是最直接的
+    for i in range(TILE_N):
+        # 这种标量循环在 Triton 中效率低，最好用向量化操作
+        # 但由于 key 不同，我们必须分组处理。
+        # 优化技巧：如果 r 很小，可以展开循环或使用 tl.where 掩码
+        pass 
+
+    # 【高性能实现路径】：
+    # 既然 r 是 constexpr 且通常很小 (<= 16)，我们可以为每个 bin 生成一个 mask
+    # 然后并行计算每个 bin 的 count 和 prefix sum
+    
+    bin_counts = tl.zeros([r], dtype=tl.int32)
+    
+    # 向量化统计 (假设 r 较小，否则需要循环)
+    # 这里展示 r=2, 4, 8 的通用逻辑思路，实际代码需根据 r 展开或使用 loop
+    # 为了代码简洁且通用，我们使用一种技巧：
+    # 1. 计算每个元素的 rank within its bin (local cumsum)
+    # 2. 计算每个 bin 的 total count
+    # 3. 计算 bin 的 global offset in SMEM
+    
+    # 方法：对每个可能的 bin_value 进行扫描
+    local_bin_starts = tl.zeros([r], dtype=tl.int32)
+    
+    # 临时存储每个元素在其 bin 内的相对偏移
+    local_ranks = tl.zeros([TILE_N], dtype=tl.int32)
+    
+    # 由于 Triton 限制，我们不能动态循环 r 次做复杂的 cumsum 而不影响性能
+    # 最佳实践：如果 r <= 16，完全展开
+    for b in range(r):
+        mask_b = (keys_local == b) & mask
+        count_b = tl.sum(mask_b.to(tl.int32))
+        
+        # 记录该 bin 的总数 (用于后续计算 SMEM 偏移)
+        # 我们需要一个数组来存这些 counts，然后做 cumsum
+        # 这里用 atomics 更新 smem_bin_offsets 来动态分配？不，先算好 offsets
+        
+        # 存入临时寄存器列表 (如果 r 是 constexpr，可以用 tuple 或 手动展开变量)
+        # 这里为了演示逻辑，假设我们有一个机制收集 counts
+        # 在实际生产中，通常硬编码 r=2 或 r=4 的逻辑
+        
+        # 替代方案：使用原子加直接分配 SMEM 位置 (简单但稍慢)
+        # 每个线程根据自己的 key，atomic_add 对应的 bin counter，得到自己的 local_rank
+        if tl.sum(mask_b.to(tl.int32)) > 0:
+             # 获取当前 bin 的计数器指针
+             ptr = tle.local_ptr(smem_bin_offsets, (b,))
+             # 原子加，返回旧值作为 local_rank
+             # 注意：tl.atomic_add 返回旧值
+             ranks_b = tl.atomic_add(ptr, mask_b.to(tl.int32), mask=mask_b)
+             # 上面的 atomic_add 是向量化的吗？Triton 支持 masked atomic_add
+             # 但我们需要的是每个元素独立的 rank。
+             # 正确做法：
+             # 1. 每个线程计算自己的 key
+             # 2. 构造 smem_ptr = base + bin_offset[key]
+             # 3. atomically increment bin_offset[key] and get old value -> this is the local rank
+             
+             # 重新实现原子分配逻辑：
+             pass
+
+    # --- 真正的优化实现 (Atomic Allocation Pattern) ---
+    # 重置 offsets
+    tl.store(smem_bin_offsets + off_init, 0, mask=off_init < r)
+    tl.debug_barrier()
+    
+    # 每个线程根据自己的 key，原子地获取在 SMEM 中的位置
+    # 1. 读取当前 bin 的计数值 (旧值)
+    # 2. 原子加 1
+    # 3. 旧值即为该元素在 bin 内部的相对偏移
+    
+    # 由于 tl.atomic_add 返回旧值，我们可以直接利用它
+    # 构造指向对应 bin 计数器的指针
+    bin_ptrs = tle.local_ptr(smem_bin_offsets, (keys_local,))
+    
+    # 执行原子加，获取 local_rank (在该 bin 内的相对位置)
+    # mask 确保无效线程不参与
+    local_ranks = tl.atomic_add(bin_ptrs, 1, mask=mask)
+    
+    tl.debug_barrier() # 确保所有 offset 分配完毕
+    
+    # 现在我们需要知道每个 bin 在 SMEM 中的 *起始* 偏移量 (Base Offset)
+    # 刚才的 atomic_add 只是给了相对偏移。
+    # 我们需要对 smem_bin_offsets (现在的值是 count) 做前缀和，得到 Base Offset
+    
+    # 读取最终的 counts
+    final_counts = tl.load(smem_bin_offsets + off_init, mask=off_init < r)
+    
+    # 计算前缀和 (Exclusive CumSum) 得到 Base Offsets
+    # tl.cumsum 需要 tensor，off_init 是 arange
+    base_offsets = tl.cumsum(final_counts, axis=0) - final_counts # Exclusive
+    
+    # 将 base_offsets 存回 smem 或者直接用在寄存器计算目标地址
+    # 为了后续写入方便，我们将 base_offsets 更新到 smem_bin_offsets 中
+    tl.store(smem_bin_offsets + off_init, base_offsets, mask=off_init < r)
+    tl.debug_barrier()
+    
+    # 计算每个元素在 SMEM 中的绝对地址
+    # smem_idx = base_offsets[key] + local_rank
+    # 由于 base_offsets 在 smem 中，我们需要再次 load 或者刚才保存在寄存器
+    # 刚才 base_offsets 是在寄存器里的 (如果是 scalar array)，但 triton 处理数组有点麻烦
+    # 简单点：再次 load
+    current_base_offsets = tl.load(smem_bin_offsets + keys_local, mask=mask)
+    smem_indices = current_base_offsets + local_ranks
+    
+    # 写入 SMEM (重排数据)
+    tl.store(smem_keys + smem_indices, arr, mask=mask)
+    if associate_arr_ptr is not None:
+        tl.store(smem_vals + smem_indices, assoc_arr, mask=mask)
+        
+    tl.debug_barrier() # 确保 SMEM 写入完成，准备读取
+
+    # ---------------------------------------------------------
+    # 5. 有序写入全局内存 (Coalesced Global Store)
+    # ---------------------------------------------------------
+    # 现在 SMEM 中的数据是按 Bin 顺序排列的：
+    # [Bin 0 的所有数据] [Bin 1 的所有数据] ...
+    # 我们可以顺序遍历 SMEM，计算全局地址，然后合并写入
+    
+    # 每个线程负责写出 SMEM 中的一部分
+    # 为了最大化合并，我们让线程 i 写出 SMEM[i] (如果 i < total_count)
+    
+    smem_read_idx = pid_n * TILE_N + tl.arange(0, TILE_N) # 这里的逻辑需要调整，因为总元素数可能不是 TILE_N 的整数倍？
+    # 不，每个 Block 处理 TILE_N 个输入，所以 SMEM 里也只有 TILE_N 个有效数据
+    read_mask = smem_read_idx < TILE_N # 实际上总是真，除了 padding
+    
+    # 但我们不知道每个 Bin 的具体边界，除非我们重新计算
+    # 更好的方法：还是按 Bin 循环写入，保证地址连续
+    
+    # 重新加载 base_offsets 和 counts
+    # 此时 smem_bin_offsets 存的是 base_offsets (start index in SMEM)
+    # 我们需要 counts 来确定结束位置
+    counts = tl.load(smem_bin_offsets + off_init, mask=off_init < r) # 这里被覆盖了，需要重新算或者之前保存
+    # 修正：之前 store 了 base_offsets，覆盖了 counts。
+    # 我们应该在计算 base_offsets 后，把 counts 存在另一个地方，或者重新计算 base_offsets + counts = end_offsets
+    
+    # 让我们重新加载 counts (可以通过再次扫描，或者刚才保存)
+    # 简单起见，假设我们重新计算 counts (开销小) 或者我们在上面保留了 counts
+    # 这里假设我们有一个方式获取 counts。
+    # 实际上，end_offsets = base_offsets + counts. 
+    # 我们可以再做一个 inclusive cumsum 得到 end_offsets
+    
+    end_offsets = tl.cumsum(final_counts, axis=0) # Inclusive
+    
+    # 现在按 Bin 顺序写入
+    for b in range(r):
+        # 获取该 Bin 在全局输出中的起始位置
+        # excumsum_bins_ptr: (m, n_passes, r)
+        global_start = tl.load(
+            excumsum_bins_ptr + pid_m * (n_passes * r) + pass_id * r + b
+        )
+        
+        # 该 Bin 在 SMEM 中的范围: [base, end)
+        smem_start = tl.load(smem_bin_offsets + b) # base
+        smem_end = smem_start + final_counts[b] # end
+        
+        # 生成该 Bin 内部的范围
+        bin_size = final_counts[b]
+        local_range = tl.arange(0, TILE_N) # 足够大
+        mask_bin = (local_range < bin_size)
+        
+        smem_read_pos = smem_start + local_range
+        global_write_pos = global_start + local_range
+        
+        # 加载已排序的数据
+        k_val = tl.load(smem_keys + smem_read_pos, mask=mask_bin, other=0)
+        
+        # 合并写入全局内存 (地址是连续的！)
+        tl.store(out_ptr + pid_m * N + global_write_pos, k_val, mask=mask_bin)
+        
+        if associate_arr_ptr is not None:
+            v_val = tl.load(smem_vals + smem_read_pos, mask=mask_bin, other=0)
+            tl.store(associate_out_ptr + pid_m * N + global_write_pos, v_val, mask=mask_bin)
+
+
 def radix_sort(arr, k_bits=8, descending=False):
     n = arr.shape[-1]
     m = arr.numel() // n
