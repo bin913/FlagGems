@@ -574,13 +574,31 @@ def radix_sort(arr, k_bits=8, descending=False):
         for i in range(0, n_passes):
             bit_offset = i * k_bits
             status.zero_()
-            sweep[grid_for_sweep](
+            # sweep[grid_for_sweep](
+            #     arr_in,
+            #     indices_in,
+            #     arr_out,
+            #     indices_out,
+            #     ex_cumsum_bins,
+            #     status,
+            #     n_passes,
+            #     i,
+            #     bit_offset,
+            #     m,
+            #     n,
+            #     grid_n,
+            #     TILE_N,
+            #     TILE_R,
+            #     k_bits,
+            #     descending,
+            # )
+            sweep_tle_optimized[grid_for_sweep](
                 arr_in,
                 indices_in,
                 arr_out,
                 indices_out,
                 ex_cumsum_bins,
-                status,
+                # status,
                 n_passes,
                 i,
                 bit_offset,
