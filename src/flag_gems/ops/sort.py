@@ -302,13 +302,13 @@ def sweep_tle_optimized(
     
     # 分配 Keys 和 Values 的共享内存缓冲
     # 布局：[bin_0_data, bin_1_data, ..., bin_r-1_data]
-    smem_keys = tle.alloc([TILE_N], dtype=tl.int32, scope=tle.smem)
-    smem_vals = tle.alloc([TILE_N], dtype=tl.int32, scope=tle.smem) if associate_arr_ptr is not None else None
+    smem_keys = tle.gpu.alloc([TILE_N], dtype=tl.int32, scope=tle.smem)
+    smem_vals = tle.gpu.alloc([TILE_N], dtype=tl.int32, scope=tle.smem) if associate_arr_ptr is not None else None
     
     # 分配用于记录每个 bin 在 SMEM 中起始位置的计数器 (在 SMEM 或 寄存器中维护)
     # 由于 r 通常很小 (2, 4, 8, 16)，我们可以用寄存器数组存 offsets，或者在 SMEM 存
     # 这里使用 SMEM 存储每个 bin 的当前写入偏移量 (相对于 SMEM 基址)
-    smem_bin_offsets = tle.alloc([r], dtype=tl.int32, scope=tle.smem)
+    smem_bin_offsets = tle.gpu.alloc([r], dtype=tl.int32, scope=tle.smem)
     
     # 初始化 bin 偏移量为 0
     # 只有第一个线程做初始化，或者用 vectorized store
@@ -387,7 +387,7 @@ def sweep_tle_optimized(
         # 每个线程根据自己的 key，atomic_add 对应的 bin counter，得到自己的 local_rank
         if tl.sum(mask_b.to(tl.int32)) > 0:
              # 获取当前 bin 的计数器指针
-             ptr = tle.local_ptr(smem_bin_offsets, (b,))
+             ptr = tle.gpu.local_ptr(smem_bin_offsets, (b,))
              # 原子加，返回旧值作为 local_rank
              # 注意：tl.atomic_add 返回旧值
              ranks_b = tl.atomic_add(ptr, mask_b.to(tl.int32), mask=mask_b)
@@ -413,7 +413,7 @@ def sweep_tle_optimized(
     
     # 由于 tl.atomic_add 返回旧值，我们可以直接利用它
     # 构造指向对应 bin 计数器的指针
-    bin_ptrs = tle.local_ptr(smem_bin_offsets, (keys_local,))
+    bin_ptrs = tle.gpu.local_ptr(smem_bin_offsets, (keys_local,))
     
     # 执行原子加，获取 local_rank (在该 bin 内的相对位置)
     # mask 确保无效线程不参与
