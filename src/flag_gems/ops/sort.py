@@ -313,7 +313,9 @@ def sweep_tle_optimized(
     # 初始化 bin 偏移量为 0
     # 只有第一个线程做初始化，或者用 vectorized store
     off_init = tl.arange(0, r)
-    tl.store(smem_bin_offsets + off_init, 0, mask=off_init < r)
+    smem_bin_offsets_ptr = tle.gpu.local_ptr(smem_bin_offsets, (off_init,))
+    tl.store(smem_bin_offsets_ptr, 0, mask=off_init < r)
+    #tl.store(smem_bin_offsets + off_init, 0, mask=off_init < r)
     tl.debug_barrier()
 
     # ---------------------------------------------------------
@@ -403,7 +405,8 @@ def sweep_tle_optimized(
 
     # --- 真正的优化实现 (Atomic Allocation Pattern) ---
     # 重置 offsets
-    tl.store(smem_bin_offsets + off_init, 0, mask=off_init < r)
+    tl.store(smem_bin_offsets_ptr, 0, mask=off_init < r)
+    #tl.store(smem_bin_offsets + off_init, 0, mask=off_init < r)
     tl.debug_barrier()
     
     # 每个线程根据自己的 key，原子地获取在 SMEM 中的位置
@@ -426,7 +429,8 @@ def sweep_tle_optimized(
     # 我们需要对 smem_bin_offsets (现在的值是 count) 做前缀和，得到 Base Offset
     
     # 读取最终的 counts
-    final_counts = tl.load(smem_bin_offsets + off_init, mask=off_init < r)
+    #final_counts = tl.load(smem_bin_offsets + off_init, mask=off_init < r)
+    final_counts = tl.load(smem_bin_offsets_ptr, mask=off_init < r)
     
     # 计算前缀和 (Exclusive CumSum) 得到 Base Offsets
     # tl.cumsum 需要 tensor，off_init 是 arange
@@ -434,7 +438,8 @@ def sweep_tle_optimized(
     
     # 将 base_offsets 存回 smem 或者直接用在寄存器计算目标地址
     # 为了后续写入方便，我们将 base_offsets 更新到 smem_bin_offsets 中
-    tl.store(smem_bin_offsets + off_init, base_offsets, mask=off_init < r)
+    tl.store(smem_bin_offsets_ptr, base_offsets, mask=off_init < r)
+    #tl.store(smem_bin_offsets + off_init, base_offsets, mask=off_init < r)
     tl.debug_barrier()
     
     # 计算每个元素在 SMEM 中的绝对地址
@@ -442,13 +447,19 @@ def sweep_tle_optimized(
     # 由于 base_offsets 在 smem 中，我们需要再次 load 或者刚才保存在寄存器
     # 刚才 base_offsets 是在寄存器里的 (如果是 scalar array)，但 triton 处理数组有点麻烦
     # 简单点：再次 load
-    current_base_offsets = tl.load(smem_bin_offsets + keys_local, mask=mask)
+    smem_bin_offsets_keys_ptr = tle.gpu.local_ptr(smem_bin_offsets,(keys_local,))
+    current_base_offsets = tl.load(smem_bin_offsets_keys_ptr, mask=mask)
+    #current_base_offsets = tl.load(smem_bin_offsets + keys_local, mask=mask)
     smem_indices = current_base_offsets + local_ranks
     
     # 写入 SMEM (重排数据)
-    tl.store(smem_keys + smem_indices, arr, mask=mask)
+    smem_keys_ptr = tle.gpu.local_ptr(smem_keys,(smem_indices,))
+    tl.store(smem_keys_ptr, arr, mask=mask)
+    #tl.store(smem_keys + smem_indices, arr, mask=mask)
     if associate_arr_ptr is not None:
-        tl.store(smem_vals + smem_indices, assoc_arr, mask=mask)
+        smem_vals_ptr = tle.gpu.local_ptr(smem_vals,(smem_indices,))
+        tl.store(smem_vals_ptr, assoc_arr, mask=mask)
+        #tl.store(smem_vals + smem_indices, assoc_arr, mask=mask)
         
     tl.debug_barrier() # 确保 SMEM 写入完成，准备读取
 
@@ -472,7 +483,8 @@ def sweep_tle_optimized(
     # 重新加载 base_offsets 和 counts
     # 此时 smem_bin_offsets 存的是 base_offsets (start index in SMEM)
     # 我们需要 counts 来确定结束位置
-    counts = tl.load(smem_bin_offsets + off_init, mask=off_init < r) # 这里被覆盖了，需要重新算或者之前保存
+    counts = tl.load(smem_bin_offsets_ptr, mask=off_init < r) # 这里被覆盖了，需要重新算或者之前保存
+    #counts = tl.load(smem_bin_offsets + off_init, mask=off_init < r) # 这里被覆盖了，需要重新算或者之前保存
     # 修正：之前 store 了 base_offsets，覆盖了 counts。
     # 我们应该在计算 base_offsets 后，把 counts 存在另一个地方，或者重新计算 base_offsets + counts = end_offsets
     
@@ -493,7 +505,9 @@ def sweep_tle_optimized(
         )
         
         # 该 Bin 在 SMEM 中的范围: [base, end)
-        smem_start = tl.load(smem_bin_offsets + b) # base
+        smem_bin_offsets_b_ptr = tle.gpu.local_ptr(smem_bin_offsets,(b,))
+        smem_start = tl.load(smem_bin_offsets_b_ptr) # base
+        #smem_start = tl.load(smem_bin_offsets + b) # base
         smem_end = smem_start + final_counts[b] # end
         
         # 生成该 Bin 内部的范围
@@ -505,13 +519,17 @@ def sweep_tle_optimized(
         global_write_pos = global_start + local_range
         
         # 加载已排序的数据
-        k_val = tl.load(smem_keys + smem_read_pos, mask=mask_bin, other=0)
+        smem_keys_ptr = tle.gpu.local_ptr(smems_keys, (smem_read_pos,))
+        k_val = tl.load(smem_keys_ptr, mask=mask_bin, other=0)
+        #k_val = tl.load(smem_keys + smem_read_pos, mask=mask_bin, other=0)
         
         # 合并写入全局内存 (地址是连续的！)
         tl.store(out_ptr + pid_m * N + global_write_pos, k_val, mask=mask_bin)
         
         if associate_arr_ptr is not None:
-            v_val = tl.load(smem_vals + smem_read_pos, mask=mask_bin, other=0)
+            smem_vals_ptr = tle.gpu.local_ptr(smem_vals,(smem_read_pos,))
+            v_val = tl.load(smem_vals_ptr, mask=mask_bin, other=0)
+            #v_val = tl.load(smem_vals + smem_read_pos, mask=mask_bin, other=0)
             tl.store(associate_out_ptr + pid_m * N + global_write_pos, v_val, mask=mask_bin)
 
 
