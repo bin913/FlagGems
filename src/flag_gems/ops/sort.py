@@ -364,7 +364,7 @@ def sweep_tle_optimized(
     # 方法 B (推荐，标准 Triton): 直接使用指针算术
     # smem_bin_offsets 应该是一个 tl.pointer_type
     # Triton 允许 pointer + tensor，自动广播步长
-    bin_ptrs = smem_bin_offsets + keys_local 
+    bin_ptrs = tle.gpu.local_ptr(smem_bin_offsets, (keys_local,)) 
 
     # 执行原子加
     # ptrs: [TILE_N] 个指针 (可能指向重复地址)
@@ -390,17 +390,17 @@ def sweep_tle_optimized(
     # 4. 计算 SMEM 绝对地址并写入
     # 读取当前 key 对应的 base offset
     # 同样使用指针算术加载
-    current_base_offsets = tl.load(smem_bin_offsets + keys_local, mask=mask)
+    current_base_offsets = tl.load(bin_ptr, mask=mask)
     
     smem_indices = current_base_offsets + local_ranks
     
     # 写入 Keys
-    smem_keys_ptr = smem_keys + smem_indices
+    smem_keys_ptr = tle.gpu.local_ptr(smem_keys, (smem_indices,))
     tl.store(smem_keys_ptr, arr, mask=mask)
     
     # 写入 Values (如果有)
     if associate_arr_ptr is not None:
-        smem_vals_ptr = smem_vals + smem_indices
+        smem_vals_ptr = tle.gpu.local_ptr(smem_vals, (smem_indices,))
         tl.store(smem_vals_ptr, assoc_arr, mask=mask)
         
     tl.debug_barrier()
