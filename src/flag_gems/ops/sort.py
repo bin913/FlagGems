@@ -220,7 +220,7 @@ def sweep(
     if associate_arr_ptr is not None:
         smem_assoc = tle.gpu.alloc(
             [TILE_N],
-            dtype=tl.dtype_of(associate_arr),
+            dtype=associate_arr.dtype,
             layout=None,
             scope=tle.gpu.smem,
             nv_mma_shared_layout=False,
