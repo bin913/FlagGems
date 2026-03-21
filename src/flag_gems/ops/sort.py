@@ -3,7 +3,8 @@ import logging
 import torch
 import triton
 import triton.language as tl
-
+import triton.experimental.tle.language as tle
+import triton.experimental.tle.language.gpu as tleg
 from flag_gems.ops.topk import _get_finfo_val, _get_iinfo_val, argsort
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
@@ -141,10 +142,6 @@ def compute_global_hist_kernel(
             )
 
 
-import triton
-import triton.language as tl
-# 假设 tle 模块已导入，包含 gpu.alloc, gpu.local_ptr 等扩展功能
-# import tle 
 
 @triton.jit
 def sweep(
@@ -209,7 +206,7 @@ def sweep(
     # --- [优化开始] 分配共享内存缓冲区 ---
     # 为当前 Tile 的数据分配共享内存，大小为 TILE_N
     # 假设 arr 和 associate_arr 数据类型一致，若不一致需分别指定 dtype
-    dtype_val = tl.dtype_of(arr)
+    dtype_val = arr.dtype
     
     smem_out = tle.gpu.alloc(
         [TILE_N],
