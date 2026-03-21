@@ -364,14 +364,14 @@ def sweep_tle_optimized(
     # 方法 B (推荐，标准 Triton): 直接使用指针算术
     # smem_bin_offsets 应该是一个 tl.pointer_type
     # Triton 允许 pointer + tensor，自动广播步长
-    bin_ptrs = tle.gpu.local_ptr(smem_bin_offsets, (keys_local,)) 
+    bin_ptr = tle.gpu.local_ptr(smem_bin_offsets, (keys_local,)) 
 
     # 执行原子加
     # ptrs: [TILE_N] 个指针 (可能指向重复地址)
     # value: 1 (标量)，每个线程都加 1
     # mask: 只有有效线程执行
     # 返回: [TILE_N] 个旧值，即每个元素在 bin 内的局部 Rank
-    local_ranks = tl.atomic_add(bin_ptrs, 1, mask=mask)
+    local_ranks = tl.atomic_add(bin_ptr, 1, mask=mask)
     
     tl.debug_barrier() # 确保所有计数完成
 
