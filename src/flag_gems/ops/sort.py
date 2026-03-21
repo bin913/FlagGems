@@ -336,132 +336,74 @@ def sweep_tle_optimized(
     arr_u = convert_to_uint_preverse_order(arr, descending)
     keys_local = (arr_u >> bit_offset) & ((1 << k_bits) - 1)
 
+   # ---------------------------------------------------------
+    # 4. 块内分桶 (Bin Packing in SMEM) - 修正版
     # ---------------------------------------------------------
-    # 4. 块内分桶 (Bin Packing in SMEM)
-    # ---------------------------------------------------------
-    # 目标：计算每个元素在 SMEM 中的目标位置
-    # 步骤 A: 统计本块内每个 bin 的数量 (Histogram)
-    # 步骤 B: 计算本块内每个 bin 的起始偏移 (Prefix Sum of Histogram)
-    # 步骤 C: 计算每个元素的局部偏移并写入 SMEM
     
-    # A. Histogram (使用原子加或 warp shuffle，这里用简单的原子加演示，因 r 小)
-    # 为了无锁，可以用寄存器累加后一次性写，但 Triton 中 atomic_add 到 smem 是最直接的
-    for i in range(TILE_N):
-        # 这种标量循环在 Triton 中效率低，最好用向量化操作
-        # 但由于 key 不同，我们必须分组处理。
-        # 优化技巧：如果 r 很小，可以展开循环或使用 tl.where 掩码
-        pass 
-
-    # 【高性能实现路径】：
-    # 既然 r 是 constexpr 且通常很小 (<= 16)，我们可以为每个 bin 生成一个 mask
-    # 然后并行计算每个 bin 的 count 和 prefix sum
-    
-    bin_counts = tl.zeros([r], dtype=tl.int32)
-    
-    # 向量化统计 (假设 r 较小，否则需要循环)
-    # 这里展示 r=2, 4, 8 的通用逻辑思路，实际代码需根据 r 展开或使用 loop
-    # 为了代码简洁且通用，我们使用一种技巧：
-    # 1. 计算每个元素的 rank within its bin (local cumsum)
-    # 2. 计算每个 bin 的 total count
-    # 3. 计算 bin 的 global offset in SMEM
-    
-    # 方法：对每个可能的 bin_value 进行扫描
-    local_bin_starts = tl.zeros([r], dtype=tl.int32)
-    
-    # 临时存储每个元素在其 bin 内的相对偏移
-    local_ranks = tl.zeros([TILE_N], dtype=tl.int32)
-    
-    # 由于 Triton 限制，我们不能动态循环 r 次做复杂的 cumsum 而不影响性能
-    # 最佳实践：如果 r <= 16，完全展开
-    for b in range(r):
-        mask_b = (keys_local == b) & mask
-        count_b = tl.sum(mask_b.to(tl.int32))
-        
-        # 记录该 bin 的总数 (用于后续计算 SMEM 偏移)
-        # 我们需要一个数组来存这些 counts，然后做 cumsum
-        # 这里用 atomics 更新 smem_bin_offsets 来动态分配？不，先算好 offsets
-        
-        # 存入临时寄存器列表 (如果 r 是 constexpr，可以用 tuple 或 手动展开变量)
-        # 这里为了演示逻辑，假设我们有一个机制收集 counts
-        # 在实际生产中，通常硬编码 r=2 或 r=4 的逻辑
-        
-        # 替代方案：使用原子加直接分配 SMEM 位置 (简单但稍慢)
-        # 每个线程根据自己的 key，atomic_add 对应的 bin counter，得到自己的 local_rank
-        if tl.sum(mask_b.to(tl.int32)) > 0:
-             # 获取当前 bin 的计数器指针
-             ptr = tle.gpu.local_ptr(smem_bin_offsets, (b,))
-             # 原子加，返回旧值作为 local_rank
-             # 注意：tl.atomic_add 返回旧值
-             ranks_b = tl.atomic_add(ptr, mask_b.to(tl.int32), mask=mask_b)
-             # 上面的 atomic_add 是向量化的吗？Triton 支持 masked atomic_add
-             # 但我们需要的是每个元素独立的 rank。
-             # 正确做法：
-             # 1. 每个线程计算自己的 key
-             # 2. 构造 smem_ptr = base + bin_offset[key]
-             # 3. atomically increment bin_offset[key] and get old value -> this is the local rank
-             
-             # 重新实现原子分配逻辑：
-             pass
-
-    # --- 真正的优化实现 (Atomic Allocation Pattern) ---
-    # 重置 offsets
+    # 1. 初始化 bin 计数器 (SMEM)
+    # smem_bin_offsets 大小为 r，初始化为 0
+    off_init = tl.arange(0, r)
+    # 假设 tle.gpu.local_ptr 支持向量索引，或者直接使用指针算术
+    # 如果 tle 封装有问题，建议直接用: smem_bin_offsets + off_init
+    smem_bin_offsets_ptr = tle.gpu.local_ptr(smem_bin_offsets, (off_init,))
     tl.store(smem_bin_offsets_ptr, 0, mask=off_init < r)
-    #tl.store(smem_bin_offsets + off_init, 0, mask=off_init < r)
-    tl.debug_barrier()
     
-    # 每个线程根据自己的 key，原子地获取在 SMEM 中的位置
-    # 1. 读取当前 bin 的计数值 (旧值)
-    # 2. 原子加 1
-    # 3. 旧值即为该元素在 bin 内部的相对偏移
+    tl.debug_barrier() 
+
+    # 2. 【核心修复】每个线程独立执行原子加
+    # 错误做法: tl.atomic_add(single_ptr, vector_values, mask) -> 报错
+    # 正确做法: tl.atomic_add(vector_ptrs, scalar_value, mask) -> 成功
     
-    # 由于 tl.atomic_add 返回旧值，我们可以直接利用它
-    # 构造指向对应 bin 计数器的指针
-    bin_ptrs = tle.gpu.local_ptr(smem_bin_offsets, (keys_local,))
+    # 构造每个线程对应的指针向量
+    # keys_local 是 [TILE_N] 的 tensor，值为 0..r-1
+    # 我们需要生成 [TILE_N] 个指针，第 i 个指针指向 smem_bin_offsets[keys_local[i]]
     
-    # 执行原子加，获取 local_rank (在该 bin 内的相对位置)
-    # mask 确保无效线程不参与
+    # 方法 A: 如果 tle.gpu.local_ptr 支持 Tensor 索引 (不确定是否支持)
+    # bin_ptrs = tle.gpu.local_ptr(smem_bin_offsets, (keys_local,))
+    
+    # 方法 B (推荐，标准 Triton): 直接使用指针算术
+    # smem_bin_offsets 应该是一个 tl.pointer_type
+    # Triton 允许 pointer + tensor，自动广播步长
+    bin_ptrs = smem_bin_offsets + keys_local 
+
+    # 执行原子加
+    # ptrs: [TILE_N] 个指针 (可能指向重复地址)
+    # value: 1 (标量)，每个线程都加 1
+    # mask: 只有有效线程执行
+    # 返回: [TILE_N] 个旧值，即每个元素在 bin 内的局部 Rank
     local_ranks = tl.atomic_add(bin_ptrs, 1, mask=mask)
     
-    tl.debug_barrier() # 确保所有 offset 分配完毕
-    
-    # 现在我们需要知道每个 bin 在 SMEM 中的 *起始* 偏移量 (Base Offset)
-    # 刚才的 atomic_add 只是给了相对偏移。
-    # 我们需要对 smem_bin_offsets (现在的值是 count) 做前缀和，得到 Base Offset
-    
-    # 读取最终的 counts
-    #final_counts = tl.load(smem_bin_offsets + off_init, mask=off_init < r)
+    tl.debug_barrier() # 确保所有计数完成
+
+    # 3. 计算前缀和 (Base Offsets)
+    # 此时 smem_bin_offsets 中存储的是每个 bin 的总数量 (Counts)
     final_counts = tl.load(smem_bin_offsets_ptr, mask=off_init < r)
     
-    # 计算前缀和 (Exclusive CumSum) 得到 Base Offsets
-    # tl.cumsum 需要 tensor，off_init 是 arange
-    base_offsets = tl.cumsum(final_counts, axis=0) - final_counts # Exclusive
+    # Exclusive CumSum: base_offsets[b] = sum(counts[0]...counts[b-1])
+    base_offsets = tl.cumsum(final_counts, axis=0) - final_counts
     
-    # 将 base_offsets 存回 smem 或者直接用在寄存器计算目标地址
-    # 为了后续写入方便，我们将 base_offsets 更新到 smem_bin_offsets 中
+    # 将 base_offsets 写回 SMEM (覆盖 counts，因为后面只需要 base)
     tl.store(smem_bin_offsets_ptr, base_offsets, mask=off_init < r)
-    #tl.store(smem_bin_offsets + off_init, base_offsets, mask=off_init < r)
-    tl.debug_barrier()
     
-    # 计算每个元素在 SMEM 中的绝对地址
-    # smem_idx = base_offsets[key] + local_rank
-    # 由于 base_offsets 在 smem 中，我们需要再次 load 或者刚才保存在寄存器
-    # 刚才 base_offsets 是在寄存器里的 (如果是 scalar array)，但 triton 处理数组有点麻烦
-    # 简单点：再次 load
-    smem_bin_offsets_keys_ptr = tle.gpu.local_ptr(smem_bin_offsets,(keys_local,))
-    current_base_offsets = tl.load(smem_bin_offsets_keys_ptr, mask=mask)
-    #current_base_offsets = tl.load(smem_bin_offsets + keys_local, mask=mask)
+    tl.debug_barrier()
+
+    # 4. 计算 SMEM 绝对地址并写入
+    # 读取当前 key 对应的 base offset
+    # 同样使用指针算术加载
+    current_base_offsets = tl.load(smem_bin_offsets + keys_local, mask=mask)
+    
     smem_indices = current_base_offsets + local_ranks
     
-    # 写入 SMEM (重排数据)
-    smem_keys_ptr = tle.gpu.local_ptr(smem_keys,(smem_indices,))
+    # 写入 Keys
+    smem_keys_ptr = smem_keys + smem_indices
     tl.store(smem_keys_ptr, arr, mask=mask)
-    #tl.store(smem_keys + smem_indices, arr, mask=mask)
+    
+    # 写入 Values (如果有)
     if associate_arr_ptr is not None:
-        smem_vals_ptr = tle.gpu.local_ptr(smem_vals,(smem_indices,))
+        smem_vals_ptr = smem_vals + smem_indices
         tl.store(smem_vals_ptr, assoc_arr, mask=mask)
-        #tl.store(smem_vals + smem_indices, assoc_arr, mask=mask)
         
-    tl.debug_barrier() # 确保 SMEM 写入完成，准备读取
+    tl.debug_barrier()
 
     # ---------------------------------------------------------
     # 5. 有序写入全局内存 (Coalesced Global Store)
