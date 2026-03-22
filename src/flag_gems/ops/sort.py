@@ -193,45 +193,16 @@ def sweep(
     n_offsets = pid_n * TILE_N + tl.arange(0, TILE_N)  # (TILE_N, )
     mask = n_offsets < N
     arr = tl.load(arr_ptr + pid_m * N + n_offsets, mask=mask)
-    
-    # 预加载 associate_arr (如果存在)，避免在循环内重复加载逻辑或条件判断开销
-    if associate_arr_ptr is not None:
-        associate_arr = tl.load(associate_arr_ptr + pid_m * N + n_offsets, mask=mask)
-    else:
-        associate_arr = None
-
     arr_u = convert_to_uint_preverse_order(arr, descending)
     key = (arr_u >> bit_offset) & bfe_mask  # (TILE_N, )
-
-    # --- [优化开始] 分配共享内存缓冲区 ---
-    # 为当前 Tile 的数据分配共享内存，大小为 TILE_N
-    # 假设 arr 和 associate_arr 数据类型一致，若不一致需分别指定 dtype
-    dtype_val = arr.dtype
-    
-    smem_out = tle.gpu.alloc(
-        [TILE_N],
-        dtype=dtype_val,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    
-    smem_assoc = None
     if associate_arr_ptr is not None:
-        smem_assoc = tle.gpu.alloc(
-            [TILE_N],
-            dtype=associate_arr.dtype,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
+        associate_arr = tl.load(
+            associate_arr_ptr + pid_m * N + n_offsets, mask=mask
         )
-    # --- [优化结束] ---
-
     # since triton can only use scalar as condition, loop by bin_index
     # status must be pre zero-initialized, or else we have to initialize it
     for bin_index in range(cta_r_start, cta_r_end):
         matches = tl.where(mask, key == bin_index, False)  # (TILE_N, ) bool
-        
         # cta level cumsum per bin
         # CAUTION: tl.sum in triton 3.2 does not promote type
         local_sum = tl.sum(matches.to(tl.uint32), axis=0)
@@ -258,67 +229,24 @@ def sweep(
         local_ex_cumsum = (
             tl.cumsum(matches.to(tl.uint32), axis=0) - matches
         )  # (TILE_N, )
-        
+        ex_cumsum_in_bin = (
+            exclusive_prefix + local_ex_cumsum
+        )  # global ex_cumsum_in_bin (TILE_N, )
+
         # ex_cumsum_bins (m, n_passes, r)
         ex_cumsum_bins = tl.load(
             excumsum_bins_ptr + pid_m * (n_passes * r) + pass_id * r + bin_index
         )  # scalar
+        pos = ex_cumsum_bins + ex_cumsum_in_bin  # (TILE_N, )
 
-        # --- [优化开始] 使用共享内存进行 Scatter 优化 ---
-        
-        # 1. 获取共享内存的本地指针
-        smem_out_ptrs = tle.gpu.local_ptr(smem_out, (tl.arange(0, TILE_N),))
-        
-        # 2. 将数据紧凑地写入共享内存
-        # 利用 local_ex_cumsum 作为 offset，使得匹配的元素在 smem 中从 0 开始连续排列
-        # 注意：这里假设 tle.gpu.local_ptr 返回的指针支持 tl.store 的 ptr_offset 或直接向量化操作
-        # 如果 tl.store 不支持直接带 offset 的 vectorized store，可能需要使用 gather/scatter 语义
-        # 但在 Triton 扩展中，通常可以直接对指针数组进行操作。
-        # 此处采用最通用的方式：构造带偏移的指针进行存储
-        
-        # 构造 SMEM 写入指针：base_ptr + local_ex_cumsum
-        # 由于 local_ex_cumsum 仅在 matches 为真时是连续递增的 (0, 1, 2...)
-        smem_write_offsets = local_ex_cumsum
-        smem_write_ptrs = tle.gpu.local_ptr(smem_out, (smem_write_offsets,))
-        
-        tl.store(smem_write_ptrs, arr, mask=matches)
+        # scatter
+        tl.store(out_ptr + pid_m * N + pos, arr, mask=matches)
+        if associate_arr_ptr is not None:
+            # associate_arr = tl.load(
+            #     associate_arr_ptr + pid_m * N + n_offsets, mask=mask
+            # )
+            tl.store(associate_out_ptr + pid_m * N + pos, associate_arr, mask=matches)
 
-        if associate_arr_ptr is not None and smem_assoc is not None:
-            smem_assoc_write_ptrs = tle.gpu.local_ptr(smem_assoc, (smem_write_offsets,))
-            tl.store(smem_assoc_write_ptrs, associate_arr, mask=matches)
-
-        # 3. 准备全局内存的连续写入
-        # 计算当前 Block 在全局输出中的起始位置
-        global_start_pos = ex_cumsum_bins + exclusive_prefix
-        
-        # 生成连续的索引范围 [0, 1, ..., TILE_N-1]
-        contiguous_range = tl.arange(0, TILE_N)
-        
-        # 有效的写入掩码：只写入前 local_sum 个元素
-        store_mask = contiguous_range < local_sum
-        
-        # 计算最终的全局连续地址
-        final_global_pos = global_start_pos + contiguous_range
-        
-        # 4. 从共享内存读取连续数据并批量写入全局内存
-        # 从 smem 的 [0, 1, ..., local_sum-1] 读取
-        smem_read_ptrs = tle.gpu.local_ptr(smem_out, (contiguous_range,))
-        vals_to_store = tl.load(smem_read_ptrs, mask=store_mask)
-        
-        tl.store(out_ptr + pid_m * N + final_global_pos, vals_to_store, mask=store_mask)
-
-        if associate_arr_ptr is not None and smem_assoc is not None:
-            smem_assoc_read_ptrs = tle.gpu.local_ptr(smem_assoc, (contiguous_range,))
-            assoc_vals_to_store = tl.load(smem_assoc_read_ptrs, mask=store_mask)
-            tl.store(associate_out_ptr + pid_m * N + final_global_pos, assoc_vals_to_store, mask=store_mask)
-            
-        # --- [优化结束] ---
-
-        # 原始 scatter 代码已被上述逻辑替代，不再执行以下代码：
-        # pos = ex_cumsum_bins + ex_cumsum_in_bin
-        # tl.store(out_ptr + pid_m * N + pos, arr, mask=matches)
-        # if associate_arr_ptr is not None:
-        #     tl.store(associate_out_ptr + pid_m * N + pos, associate_arr, mask=matches)
 
 
 def radix_sort(arr, k_bits=8, descending=False):
