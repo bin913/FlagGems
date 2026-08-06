@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.utils import libentry
+from flag_gems.utils import libentry, libtuner
 
 
 @libentry()
@@ -27,7 +27,7 @@ from flag_gems.utils import libentry
     key=["_M_NPO2", "N", "K"],
 )
 @triton.jit
-def _int8_gemm_unmasked_kernel( # pragma: no cover
+def _int8_gemm_unmasked_kernel(  # pragma: no cover
     c_ptr,
     a_ptr,
     b_ptr,

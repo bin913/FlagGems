@@ -3,12 +3,10 @@
 import pytest
 import torch
 
-# import flag_gems
-import flag_gems.ops
-from flag_gems.ops import int8_gemm as gems_int8_gemm
 from benchmark.attri_util import DEFAULT_METRICS, BenchLevel
 from benchmark.conftest import Config
 from benchmark.performance_utils import Benchmark
+from flag_gems.ops import int8_gemm as gems_int8_gemm
 
 
 # -----------------------------
@@ -128,7 +126,7 @@ class Int8GemmBenchmark(Benchmark):
         ]
 
     def get_input_iter(self, cur_dtype):
-        for (m, n, k) in self.shapes:
+        for m, n, k in self.shapes:
             yield from self.input_fn(m, n, k, cur_dtype, self.device)
 
     def get_tflops(self, op, *args, **kwargs):

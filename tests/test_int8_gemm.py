@@ -150,13 +150,13 @@ def test_accuracy_int8_gemm_noncontiguous_inputs(out_dtype):
     )
     a = a_base[:, ::2]  # (M, K), non-contiguous stride
 
-    w_base = torch.randint(
-        -128, 127, (N, K), dtype=torch.int8, device=flag_gems.device
-    )
+    w_base = torch.randint(-128, 127, (N, K), dtype=torch.int8, device=flag_gems.device)
     w = w_base.t()  # (K, N), likely non-contiguous
 
     a_scale = 0.02
-    w_scale = torch.rand((N,), device=flag_gems.device, dtype=torch.float32) * 0.05 + 0.001
+    w_scale = (
+        torch.rand((N,), device=flag_gems.device, dtype=torch.float32) * 0.05 + 0.001
+    )
     bias = torch.randn((N,), device=flag_gems.device, dtype=torch.float32)
 
     ref_a = to_reference(a, True)
