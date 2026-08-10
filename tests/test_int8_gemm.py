@@ -4,6 +4,11 @@ import torch
 
 import flag_gems
 
+# CI runners (Ampere A100) enable TF32 for fp32 matmul by default, which
+# pollutes an fp32 reference matmul by ~1e-1 absolute error. Compute the
+# reference in fp64 (immune to TF32) when the device supports it.
+fp64_is_supported = flag_gems.runtime.device.support_fp64
+
 
 def to_reference(x, keep_device: bool = True):
     """
@@ -32,7 +37,7 @@ def int8_gemm_reference(
     out_dtype=torch.float32,
 ):
     """
-    Reference: dequant -> fp32 compute -> optional bias -> cast to out_dtype
+    Reference: dequant -> fp64 compute -> optional bias -> cast to out_dtype
 
     a_int8: (M, K) int8
     w_int8: (K, N) int8
@@ -40,8 +45,10 @@ def int8_gemm_reference(
     w_scale: scalar or (N,) tensor
     bias: None or (N,) tensor
     """
-    # Always compute in float32 to avoid dtype pollution (e.g., float64 w_scale).
-    compute_dtype = torch.float32
+    # Compute in fp64: TF32 (enabled by default on Ampere, e.g. the CI A100)
+    # degrades fp32 matmul precision and would make the reference itself
+    # inaccurate. fp64 matmul is exact and immune to TF32.
+    compute_dtype = torch.float64 if fp64_is_supported else torch.float32
 
     # a_scale: allow python float or tensor
     if torch.is_tensor(a_scale):
