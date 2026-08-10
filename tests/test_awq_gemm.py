@@ -5,7 +5,7 @@ import flag_gems
 from flag_gems.ops.awq_gemm import awq_gemm, pack_awq_weight
 
 from . import accuracy_utils as utils
-from .conftest import QUICK_MODE
+from .conftest import QUICK_MODE, TO_CPU
 
 if QUICK_MODE:
     AWQ_SHAPES = [
@@ -29,6 +29,13 @@ INPUT_DTYPES = [torch.float16, torch.bfloat16]
 
 def awq_reference(x, qweight, qzeros, scales, group_size):
     """Exact dequantized reference: out = input @ ((code - zero) * scale)."""
+    if TO_CPU:
+        # In quick-cpu mode the reference must be computed on the CPU while
+        # the operator under test still runs on the device.
+        x = x.cpu()
+        qweight = qweight.cpu()
+        qzeros = qzeros.cpu() if qzeros is not None else None
+        scales = scales.cpu()
     K = x.shape[1]
     N = qweight.shape[1]
     G = K // group_size
