@@ -76,6 +76,25 @@ def make_input(
     return q, k, v
 
 
+def _sdpa_autograd_grads(q, k, v, grad_out, scale, is_causal, enable_gqa):
+    """Reference SDPA gradients computed through PyTorch's own autograd."""
+    q = q.detach().clone().requires_grad_(True)
+    k = k.detach().clone().requires_grad_(True)
+    v = v.detach().clone().requires_grad_(True)
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+    out.backward(grad_out)
+    return q.grad, k.grad, v.grad
+
+
 @pytest.mark.scaled_dot_product_flash_attention_backward
 @pytest.mark.parametrize(
     "batch, num_q_head, num_kv_head, q_seq_len, kv_seq_len, head_size, is_causal",
@@ -106,22 +125,21 @@ def test_scaled_dot_product_flash_attention_backward(
     )
     enable_gqa = num_q_head != num_kv_head
 
-    # Reference gradients from PyTorch's own SDPA autograd.
-    ref_q = q.detach().clone().requires_grad_(True)
-    ref_k = k.detach().clone().requires_grad_(True)
-    ref_v = v.detach().clone().requires_grad_(True)
-    ref_out = torch.nn.functional.scaled_dot_product_attention(
-        ref_q,
-        ref_k,
-        ref_v,
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=is_causal,
-        scale=scale,
-        enable_gqa=enable_gqa,
+    # Reference gradients from PyTorch's own SDPA autograd. By default the
+    # reference runs on the GPU at the same dtype as the operator under test;
+    # with ``--ref cpu`` (TO_CPU) it is computed through the CPU math backend
+    # in float64 for higher precision.
+    grad_out = torch.randn_like(q)
+    if utils.TO_CPU:
+        ref_q = utils.to_reference(q, True)
+        ref_k = utils.to_reference(k, True)
+        ref_v = utils.to_reference(v, True)
+        ref_go = utils.to_reference(grad_out, True)
+    else:
+        ref_q, ref_k, ref_v, ref_go = q, k, v, grad_out
+    ref_q_g, ref_k_g, ref_v_g = _sdpa_autograd_grads(
+        ref_q, ref_k, ref_v, ref_go, scale, is_causal, enable_gqa
     )
-    grad_out = torch.randn_like(ref_q)
-    ref_out.backward(grad_out)
 
     # Gradients through FlagGems' ATen flash-attention forward/backward pair.
     philox_seed = torch.empty(0, dtype=torch.long, device=current_device)
@@ -150,8 +168,8 @@ def test_scaled_dot_product_flash_attention_backward(
             )
         )
 
-    utils.gems_assert_close(dq, ref_q.grad, dtype, equal_nan=True)
-    utils.gems_assert_close(dk, ref_k.grad, dtype, equal_nan=True)
+    utils.gems_assert_close(dq, ref_q_g, dtype, equal_nan=True)
+    utils.gems_assert_close(dk, ref_k_g, dtype, equal_nan=True)
     # dV is more sensitive to softmax recomputation errors in the flash
     # backward (no centering term), mirroring the existing SDPA tests.
     if enable_gqa:
@@ -164,4 +182,4 @@ def test_scaled_dot_product_flash_attention_backward(
             v_atol = 5e-3
         else:
             v_atol = 2e-3
-    utils.gems_assert_close(dv, ref_v.grad, dtype, equal_nan=True, atol=v_atol)
+    utils.gems_assert_close(dv, ref_v_g, dtype, equal_nan=True, atol=v_atol)
