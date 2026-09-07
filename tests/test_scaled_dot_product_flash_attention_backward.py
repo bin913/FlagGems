@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Accuracy tests for the ATen ``_scaled_dot_product_flash_attention_backward``
+"""Accuracy tests for the ``_scaled_dot_product_flash_attention_backward``
 operator (registered as ``scaled_dot_product_flash_attention_backward``).
 
-The backward op is exercised directly through the ATen entry points used by
-PyTorch's FlashAttention autograd, i.e. the forward ``_scaled_dot_product_flash_attention``
-followed by ``_scaled_dot_product_flash_attention_backward`` with the tensors the
-ATen interface passes around (``[B, H, S, D]`` layout).
+The backward op is exercised through the same tensors the ATen interface passes
+around (``[B, H, S, D]`` layout): the FlagGems forward
+``_scaled_dot_product_flash_attention`` followed by
+``scaled_dot_product_flash_attention_backward``.
 
 Causal is only combined with equal ``q_seq_len == kv_seq_len`` shapes: the fused
 flash kernels align the causal diagonal between query and key and therefore match
@@ -141,32 +141,29 @@ def test_scaled_dot_product_flash_attention_backward(
         ref_q, ref_k, ref_v, ref_go, scale, is_causal, enable_gqa
     )
 
-    # Gradients through FlagGems' ATen flash-attention forward/backward pair.
+    # Gradients through FlagGems' flash-attention forward/backward pair.
     philox_seed = torch.empty(0, dtype=torch.long, device=current_device)
     philox_offset = torch.empty(0, dtype=torch.long, device=current_device)
-    with flag_gems.use_gems():
-        out, logsumexp = torch.ops.aten._scaled_dot_product_flash_attention.default(
-            q, k, v, 0.0, is_causal, False, scale=scale
-        )[:2]
-        dq, dk, dv = (
-            torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
-                grad_out,
-                q,
-                k,
-                v,
-                out,
-                logsumexp,
-                None,
-                None,
-                q_seq_len,
-                kv_seq_len,
-                0.0,
-                is_causal,
-                philox_seed,
-                philox_offset,
-                scale=scale,
-            )
-        )
+    out, logsumexp = flag_gems._scaled_dot_product_flash_attention(
+        q, k, v, 0.0, is_causal, False, scale=scale
+    )[:2]
+    dq, dk, dv = flag_gems.scaled_dot_product_flash_attention_backward(
+        grad_out,
+        q,
+        k,
+        v,
+        out,
+        logsumexp,
+        None,
+        None,
+        q_seq_len,
+        kv_seq_len,
+        0.0,
+        is_causal,
+        philox_seed,
+        philox_offset,
+        scale=scale,
+    )
 
     utils.gems_assert_close(dq, ref_q_g, dtype, equal_nan=True)
     utils.gems_assert_close(dk, ref_k_g, dtype, equal_nan=True)
