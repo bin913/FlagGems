@@ -225,9 +225,15 @@ def apply_rotary_pos_emb(
             len(q.shape) == 4
         ), f"q must be 4-D when position_ids is not provided, got {q.shape}"
         seq_len = q.shape[-3]
+        batch = q.shape[0]
         # cos/sin indexed as cos[0:seq_len]: shape [seq_len, D/2]
         cos_sel = cos[:seq_len]
         sin_sel = sin[:seq_len]
+        if batch > 1:
+            # Without position_ids each batch reuses positions 0..seq_len-1,
+            # while the flattened state has batch*seq_len rows: tile the cache.
+            cos_sel = cos_sel.repeat(batch, 1)
+            sin_sel = sin_sel.repeat(batch, 1)
     else:
         assert (
             position_ids.shape == q.shape[:-2]
@@ -273,8 +279,17 @@ def apply_rotary_pos_emb(
             )
 
     if inplace:
-        _launch(q, q, num_q_heads)
-        _launch(k, k, num_k_heads)
+        # The kernel is always launched out-of-place.  Launching an in-place
+        # kernel with more programs than the number of NPU AI cores makes
+        # consecutive program waves overwrite the same global memory while the
+        # earlier wave is still running, which corrupts the first tile.  So for
+        # `inplace=True` we rotate into temporaries first and copy them back.
+        q_embed = torch.empty_like(q)
+        k_embed = torch.empty_like(k)
+        _launch(q_embed, q, num_q_heads)
+        _launch(k_embed, k, num_k_heads)
+        q.copy_(q_embed)
+        k.copy_(k_embed)
         return q.view(q_shape), k.view(k_shape)
     else:
         q_embed = torch.empty_like(q)
