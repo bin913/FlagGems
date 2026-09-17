@@ -59,8 +59,7 @@ def test_alias_copy_out_non_contiguous(dtype):
     out = torch.empty_like(inp)
 
     torch.ops.aten.alias_copy(ref_inp, out=ref_out)
-    with flag_gems.use_gems():
-        res_out = torch.ops.aten.alias_copy(inp, out=out)
+    res_out = flag_gems.alias_copy_out(inp, out=out)
 
     assert res_out is out
     utils.gems_assert_equal(res_out, ref_out)
@@ -76,8 +75,7 @@ def test_alias_copy_out_empty(dtype):
     out = torch.empty_like(inp)
 
     torch.ops.aten.alias_copy(ref_inp, out=ref_out)
-    with flag_gems.use_gems():
-        res_out = torch.ops.aten.alias_copy(inp, out=out)
+    res_out = flag_gems.alias_copy_out(inp, out=out)
 
     assert res_out is out
     utils.gems_assert_equal(res_out, ref_out)
