@@ -117,7 +117,7 @@ def addmm_kernel(
                 other=0.0,
             )
             # tl.dot rejects mixed-dtype operands; cast to the output dtype so that
-# mixed inputs follow torch's type promotion (issue #2463).
+            # mixed inputs follow torch's type promotion (issue #2463).
             if a.dtype != b.dtype:
                 a = a.to(c_ptr.dtype.element_ty)
                 b = b.to(c_ptr.dtype.element_ty)

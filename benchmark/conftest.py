@@ -21,6 +21,7 @@ import torch
 import yaml
 
 import flag_gems
+from flag_gems.cli_override import add_override_arguments, apply_overrides_from_args
 from flag_gems.runtime import torch_device_fn
 
 from . import consts
@@ -95,6 +96,7 @@ class BenchConfig:
         self.shape_file = os.path.join(os.path.dirname(__file__), "core_shapes.yaml")
         self.query = False
         self.parallel = 0
+        self.mm_layout = None
 
 
 def pytest_addoption(parser):
@@ -207,6 +209,18 @@ def pytest_addoption(parser):
         ),
     )
 
+    parser.addoption(
+        "--mm-layout",
+        action="store",
+        default=None,
+        choices=["nn", "nt", "both"],
+        help=(
+            "Select the B layout for the MM benchmark: nn uses row-major B, "
+            "nt uses column-major B, and both runs both layouts. By default, "
+            "core runs nn while comprehensive runs both."
+        ),
+    )
+
     try:
         parser.addoption(
             "--collect-marks",
@@ -215,6 +229,9 @@ def pytest_addoption(parser):
         )
     except ValueError:
         pass
+
+    # Add dynamic operator override options
+    add_override_arguments(parser)
 
 
 def pytest_configure(config):
@@ -258,6 +275,7 @@ def pytest_configure(config):
     Config.record_json = config.getoption("--record") == "json"
 
     Config.parallel = int(config.getoption("--parallel") or 0)
+    Config.mm_layout = config.getoption("--mm-layout")
     if Config.record_json:
         Config.output = config.getoption("--output")
         REPORT_FILE = Config.output
@@ -285,6 +303,15 @@ def pytest_configure(config):
         recordLogger.addHandler(handler)
         recordLogger.setLevel(logging.INFO)
         emit_record_logger("Benchmark record logger enabled")
+
+    # Apply dynamic operator overrides
+    config._override_registry = apply_overrides_from_args(config.option)
+
+
+def pytest_unconfigure(config):
+    """Cleanup: restore all overridden operators."""
+    if hasattr(config, "_override_registry"):
+        config._override_registry.restore_all()
 
 
 @pytest.fixture(scope="session", autouse=True)
