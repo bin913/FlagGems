@@ -42,9 +42,7 @@ else:
     # Issue #2345: fp64 inputs previously failed to compile because the kernel
     # accumulator was hardcoded to fp32. Keep fp64 in the dtype list so this
     # regression stays covered (only when the device supports fp64).
-    FLOAT_DTYPES = FLOAT_DTYPES + (
-        [torch.float64] if utils.fp64_is_supported else []
-    )
+    FLOAT_DTYPES = FLOAT_DTYPES + ([torch.float64] if utils.fp64_is_supported else [])
     STRIDES = [1, 2]
     PADDINGS = [0, 1]
     DILATIONS = [1]  # original: [1, 2], dilation=2 commented out to reduce CI timeout
