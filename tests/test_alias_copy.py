@@ -56,7 +56,9 @@ def test_alias_copy_out_non_contiguous(dtype):
     inp = base.t()  # [8, 6] transposed view, not contiguous
     ref_inp = utils.to_reference(inp)
     ref_out = torch.empty_like(ref_inp)
-    out = torch.empty_like(inp)
+    # The gems alias_copy_out entry point requires a contiguous destination, so
+    # only the input view carries the non-contiguity under test here.
+    out = torch.empty_like(inp, memory_format=torch.contiguous_format)
 
     torch.ops.aten.alias_copy(ref_inp, out=ref_out)
     res_out = flag_gems.alias_copy_out(inp, out=out)
