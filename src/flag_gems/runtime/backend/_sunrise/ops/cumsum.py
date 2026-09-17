@@ -240,8 +240,9 @@ def cumsum_wrapper(inp, dim=1, dtype=None, out=None):
     if out is None:
         out = torch.empty_like(inp, dtype=dtype)
 
-    # Empty tensor: return early to avoid the zero-size division below
-    # (issue #4602), matching torch.cumsum semantics.
+    # An empty input has nothing to scan, and `N` is 0 whenever the scanned
+    # dimension is empty -- computing K first would divide by zero. Same guard
+    # as the generic cumsum (#4541), which this vendor copy never received.
     if inp.numel() == 0:
         return out
 
