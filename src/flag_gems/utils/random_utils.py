@@ -63,6 +63,29 @@ def philox_backend_seed_offset(increment, generator=None):
             generator = _SPACEMIT_CPU_GENERATOR
         else:
             generator = torch_device_fn.default_generators[device]
+
+    # Ascend's generator state is not the CUDA `[seed, offset]` int64 pair that
+    # the code below unpacks. `get_state()` returns a state tensor longer than
+    # two int64s there, so `c0, c1 = state_copy.view(torch.int64)` raises
+    # "ValueError: too many values to unpack (expected 2)" (issue #6216). The
+    # kunlunxin/aipu branch only sidesteps that by *guessing* that the pair sits
+    # in the last two slots, which is a property of that generator, not of the
+    # state format in general.
+    #
+    # Every op that draws philox randomness goes through here (`randn`,
+    # `randn_like`, `dropout`, `bernoulli`, `binomial`, `cauchy`, ...), so none
+    # of them ran at all on Ascend.
+    #
+    # The generator owns both fields and exposes them directly, which is how the
+    # Ascend backend already reads them elsewhere
+    # (`_ascend/ops/rrelu_with_noise.py::_lean_seed_offset`); it also avoids
+    # materialising and re-uploading the whole state tensor on each draw.
+    if flag_gems.vendor_name == "ascend":
+        increment = (increment + 3) // 4 * 4
+        offset = generator.get_offset()
+        generator.set_offset(offset + increment)
+        return generator.initial_seed(), offset
+
     state_copy = generator.get_state()
     # TODO[kunlunxin]: we will upgrade torch version in 2025.04
     if flag_gems.vendor_name in ("kunlunxin", "aipu"):
@@ -96,6 +119,16 @@ def set_philox_state(seed, offset, device=None):
         state_view[-2] = seed
         state_view[-1] = offset
         gen.set_state(state_copy)
+    elif flag_gems.vendor_name == "ascend":
+        # Companion of the branch in philox_backend_seed_offset: the seed and
+        # the offset are not the first two int64 slots of the state tensor on
+        # Ascend, so writing them by index would silently leave the generator
+        # untouched while the reader picks up the real fields. `manual_seed`
+        # also resets the offset, so set it afterwards.
+        device = device or torch_device_fn.current_device()
+        gen = torch_device_fn.default_generators[device]
+        gen.manual_seed(seed)
+        gen.set_offset(offset)
     else:
         device = device or torch_device_fn.current_device()
         gen = torch_device_fn.default_generators[device]

@@ -16,8 +16,31 @@ import pytest
 import torch
 
 import flag_gems
+from flag_gems.utils.random_utils import (
+    philox_backend_seed_offset,
+    set_philox_state,
+)
 
 from . import accuracy_utils as utils
+
+
+@pytest.mark.randn
+def test_philox_seed_offset_roundtrip():
+    # Regression test for #6216. `philox_backend_seed_offset` used to unpack
+    # `generator.get_state().view(torch.int64)` into exactly two values, which
+    # only holds for CUDA's [seed, offset] generator state; the NPU state is
+    # longer, so `randn` / `randn_like` / `dropout` / `bernoulli` all raised
+    # "ValueError: too many values to unpack (expected 2)" there. The offset a
+    # return value reports is the one from *before* the advance, and the
+    # advance itself is rounded up to a multiple of 4.
+    seed, offset = 1234567890, 0
+    set_philox_state(seed, offset)
+
+    assert philox_backend_seed_offset(4) == (seed, offset)
+
+    got_seed, got_offset = philox_backend_seed_offset(5)
+    assert got_seed == seed
+    assert got_offset == offset + 4
 
 
 @pytest.mark.randn
