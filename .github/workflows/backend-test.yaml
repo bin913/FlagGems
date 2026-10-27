@@ -84,11 +84,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         continue-on-error: true
-      - uses: ./.github/actions/checkout-retry
-      - uses: ./.github/actions/setup-flaggems
+      - uses: flagos-ai/FlagOps/actions/checkout-retry@main
+      - uses: flagos-ai/FlagOps/actions/setup-project@main
         with:
           backend: ${{ inputs.backend }}
-          gpu_check_script: ${{ inputs.gpu_check_script }}
+          vllm-version: '0.21.0'
+          gpu-check-script: ${{ inputs.gpu_check_script }}
 
       - name: Test alpha ops
         if: ${{ inputs.test_script != '' }}
@@ -145,7 +146,7 @@ jobs:
       # against /home/runner/_work while checkout writes to the container's
       # /__w, so ./ refs can't be found. Remote refs are fetched into the
       # runner's _actions cache and don't depend on the workspace path.
-      - uses: flagos-ai/FlagGems/.github/actions/checkout-retry@master
+      - uses: flagos-ai/FlagOps/actions/checkout-retry@main
       # Do NOT use setup-flaggems here: it runs setup.sh, which builds a fresh
       # .venv and unconditionally reinstalls flagtree from backends.yaml. On the
       # runtime image the compiler and heavy deps (flagtree/torch/xmlir…) are
@@ -183,6 +184,7 @@ jobs:
         shell: bash --login -e -o pipefail {0}
         env:
           CHANGED_FILES: ${{ inputs.changed_files }}
+          XPU_EVENT_KL3_ENABLE: "1"
         run: |
           tools/test-op.sh ${{ inputs.pr_id }}
 
@@ -211,7 +213,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         continue-on-error: true
-      - uses: flagos-ai/FlagGems/.github/actions/checkout-retry@master
+      - uses: flagos-ai/FlagOps/actions/checkout-retry@main
       # Trust the runtime image's preinstalled compiler/deps and reconcile
       # instead of running setup.sh (which rebuilds a venv and reinstalls
       # flagtree + heavy deps over the network). See test-kunlunxin.
@@ -252,11 +254,11 @@ jobs:
   #     pkg.flytiger-eco.com/docker_release/pytorch:v2.1.1-2.10.0-ubuntu24.04-cuda13.0-py312 bash
   # with GitHub Actions creating/starting the container and exec'ing each step.
   #
-  # Unlike hygon/metax/iluvatar/mthreads below, this image only ships a bare
-  # torch — flagtree for this backend isn't published to FlagOS's pypi_base
-  # yet (see backends.yaml's extra_index comment), so there's nothing to
-  # reconcile against. Run setup-flaggems/setup.sh here to install it from the
-  # vendor's temporary index instead of reconcile_backend_deps.py.
+  # torch and flagtree for this backend are now published to FlagOS's
+  # pypi_base, so (like hygon/metax/iluvatar/mthreads below) we trust the
+  # runtime image's preinstalled torch and reconcile instead of running
+  # setup.sh (which rebuilds a venv and reinstalls torch over the network
+  # even when the image already matches). See test-kunlunxin.
   test-thead:
     if: ${{ inputs.backend == 'thead' }}
     runs-on: >-
@@ -273,26 +275,34 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         continue-on-error: true
-      - uses: ./.github/actions/checkout-retry
-      - uses: ./.github/actions/setup-flaggems
-        with:
-          backend: ${{ inputs.backend }}
-          gpu_check_script: ${{ inputs.gpu_check_script }}
+      - uses: flagos-ai/FlagOps/actions/checkout-retry@main
+      - name: Install FlagGems (thead, reconcile deps with image)
+        shell: bash --login -e -o pipefail {0}
+        run: |
+          pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+          pip config set global.extra-index-url "https://mirrors.aliyun.com/pypi/simple/ https://mirrors.cloud.tencent.com/pypi/simple/"
+          pip config set global.trusted-host "pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com mirrors.cloud.tencent.com"
+          pip install --no-deps .
+          python3 tools/reconcile_backend_deps.py "${{ inputs.backend }}"
+          pip install .[test]
+      - name: Check GPU availability
+        if: ${{ inputs.gpu_check_script != '' }}
+        shell: bash --login -e -o pipefail {0}
+        run: bash ${{ inputs.gpu_check_script }}
 
       - name: Test alpha ops
         if: ${{ inputs.test_script != '' }}
         env:
           CHANGED_FILES: ${{ inputs.changed_files }}
-        shell: bash
+        shell: bash --login -e -o pipefail {0}
         run: |
           bash ${{ inputs.test_script }} ${{ inputs.backend }} ${{ inputs.pr_id }}
       - name: Run backend tests
         if: ${{ inputs.test_script == '' }}
-        shell: bash
+        shell: bash --login -e -o pipefail {0}
         env:
           CHANGED_FILES: ${{ inputs.changed_files }}
         run: |
-          source .venv/bin/activate
           tools/test-op.sh ${{ inputs.pr_id }}
 
   # Hygon runs inside a container on whichever hygon-bw1000-* server this
@@ -323,7 +333,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         continue-on-error: true
-      - uses: flagos-ai/FlagGems/.github/actions/checkout-retry@master
+      - uses: flagos-ai/FlagOps/actions/checkout-retry@main
       # Do NOT use setup-flaggems here: it runs setup.sh, which builds a fresh
       # .venv and reinstalls flagtree + heavy deps from the network (flaky — a
       # pip fetch timeout on fsspec already failed this job once). On the runtime
@@ -388,7 +398,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         continue-on-error: true
-      - uses: flagos-ai/FlagGems/.github/actions/checkout-retry@master
+      - uses: flagos-ai/FlagOps/actions/checkout-retry@main
       # Trust the runtime image's preinstalled compiler/deps and reconcile
       # instead of running setup.sh (which rebuilds a venv and reinstalls
       # flagtree + heavy deps over the network). See test-kunlunxin.
@@ -448,7 +458,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         continue-on-error: true
-      - uses: flagos-ai/FlagGems/.github/actions/checkout-retry@master
+      - uses: flagos-ai/FlagOps/actions/checkout-retry@main
       # Trust the runtime image's preinstalled compiler/deps and reconcile
       # instead of running setup.sh (which rebuilds a venv and reinstalls
       # flagtree + heavy deps over the network). See test-kunlunxin.
